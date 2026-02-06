@@ -14,9 +14,9 @@ import (
 	"github.com/goccy/go-yaml"
 	"github.com/pelletier/go-toml/v2"
 
-	"github.com/antonmedv/fx/internal/engine"
-	"github.com/antonmedv/fx/internal/jsonx"
-	"github.com/antonmedv/fx/internal/shlex"
+	"github.com/zxyqq/fx/internal/engine"
+	"github.com/zxyqq/fx/internal/jsonx"
+	"github.com/zxyqq/fx/internal/shlex"
 )
 
 type Reply struct {

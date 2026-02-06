@@ -7,8 +7,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/antonmedv/fx/internal/jsonx"
-	"github.com/antonmedv/fx/internal/pretty"
+	"github.com/zxyqq/fx/internal/jsonx"
+	"github.com/zxyqq/fx/internal/pretty"
 )
 
 func TestIsInlineable(t *testing.T) {

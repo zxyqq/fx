@@ -5,7 +5,7 @@ import (
 
 	"github.com/mattn/go-runewidth"
 
-	"github.com/antonmedv/fx/internal/ident"
+	"github.com/zxyqq/fx/internal/ident"
 )
 
 func DropWrapAll(n *Node) {

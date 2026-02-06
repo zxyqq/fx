@@ -6,10 +6,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/antonmedv/fx/internal/ident"
-	. "github.com/antonmedv/fx/internal/jsonx"
-	"github.com/antonmedv/fx/internal/theme"
-	"github.com/antonmedv/fx/internal/utils"
+	"github.com/zxyqq/fx/internal/ident"
+	. "github.com/zxyqq/fx/internal/jsonx"
+	"github.com/zxyqq/fx/internal/theme"
+	"github.com/zxyqq/fx/internal/utils"
 )
 
 func (m *model) View() string {

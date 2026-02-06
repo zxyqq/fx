@@ -6,8 +6,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/antonmedv/fx/internal/engine"
-	"github.com/antonmedv/fx/internal/jsonx"
+	"github.com/zxyqq/fx/internal/engine"
+	"github.com/zxyqq/fx/internal/jsonx"
 )
 
 func TestEngine(t *testing.T) {

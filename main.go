@@ -15,7 +15,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/antonmedv/clipboard"
+	"github.com/zxyqq/clipboard"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -24,14 +24,14 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-isatty"
 
-	"github.com/antonmedv/fx/internal/complete"
-	"github.com/antonmedv/fx/internal/engine"
-	"github.com/antonmedv/fx/internal/fuzzy"
-	"github.com/antonmedv/fx/internal/jsonpath"
-	. "github.com/antonmedv/fx/internal/jsonx"
-	"github.com/antonmedv/fx/internal/theme"
-	"github.com/antonmedv/fx/internal/toml"
-	"github.com/antonmedv/fx/internal/utils"
+	"github.com/zxyqq/fx/internal/complete"
+	"github.com/zxyqq/fx/internal/engine"
+	"github.com/zxyqq/fx/internal/fuzzy"
+	"github.com/zxyqq/fx/internal/jsonpath"
+	. "github.com/zxyqq/fx/internal/jsonx"
+	"github.com/zxyqq/fx/internal/theme"
+	"github.com/zxyqq/fx/internal/toml"
+	"github.com/zxyqq/fx/internal/utils"
 )
 
 var (

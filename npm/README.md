@@ -101,7 +101,7 @@ Fx has a shortcut for the map function. Fox example, `this.map(x => x.commit.mes
 can be rewritten without leading dot and without `x => x` parts.  
 
 ```sh
-curl https://api.github.com/repos/antonmedv/fx/commits | fx 'map(.commit.message)'
+curl https://api.github.com/repos/zxyqq/fx/commits | fx 'map(.commit.message)'
 ```
 
 ```sh

@@ -10,7 +10,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 
-	"github.com/antonmedv/fx/internal/jsonx"
+	"github.com/zxyqq/fx/internal/jsonx"
 )
 
 type Theme struct {

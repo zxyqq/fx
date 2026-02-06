@@ -10,7 +10,7 @@
   "scripts": {
     "test": "node test.js"
   },
-  "repository": "antonmedv/fx",
+  "repository": "zxyqq/fx",
   "homepage": "https://fx.wtf",
   "description": "Command-line JSON viewer",
   "author": "Anton Medvedev <anton@medv.io>",

@@ -3,9 +3,9 @@ package pretty
 import (
 	"strings"
 
-	"github.com/antonmedv/fx/internal/ident"
-	"github.com/antonmedv/fx/internal/jsonx"
-	"github.com/antonmedv/fx/internal/theme"
+	"github.com/zxyqq/fx/internal/ident"
+	"github.com/zxyqq/fx/internal/jsonx"
+	"github.com/zxyqq/fx/internal/theme"
 )
 
 // Print pretty prints a Node. Node must be the top (head),
