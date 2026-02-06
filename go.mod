@@ -1,11 +1,11 @@
-module github.com/antonmedv/fx
+module github.com/zxyqq/fx
 
 go 1.23.0
 
 toolchain go1.23.6
 
 require (
-	github.com/antonmedv/clipboard v1.0.1
+	github.com/zxyqq/clipboard
 	github.com/charmbracelet/bubbles v0.21.0
 	github.com/charmbracelet/bubbletea v1.3.6
 	github.com/charmbracelet/lipgloss v1.1.0
