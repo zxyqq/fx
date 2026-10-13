@@ -7,23 +7,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	"github.com/charmbracelet/x/exp/teatest"
-	"github.com/muesli/termenv"
+	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/colorprofile"
+	"github.com/charmbracelet/x/exp/teatest/v2"
 	"github.com/stretchr/testify/require"
 
 	"github.com/zxyqq/fx/internal/jsonx"
 )
 
-func init() {
-	lipgloss.SetColorProfile(termenv.ANSI)
-}
-
 type options struct {
 	showSizes       bool
 	showLineNumbers bool
+	height          int // terminal rows; 0 means 40
 }
 
 func prepare(t *testing.T, opts ...options) *teatest.TestModel {
@@ -37,26 +32,38 @@ func prepare(t *testing.T, opts ...options) *teatest.TestModel {
 	require.NoError(t, err)
 
 	m := &model{
-		top:          head,
-		head:         head,
-		bottom:       head,
-		totalLines:   head.Bottom().LineNumber,
+		viewState: viewState{
+			top:        head,
+			head:       head,
+			bottom:     head,
+			totalLines: head.Bottom().LineNumber,
+			search:     newSearch(),
+		},
 		eof:          true,
 		wrap:         true,
 		showCursor:   true,
-		searchInput:  textinput.New(),
-		search:       newSearch(),
-		commandInput: textinput.New(),
+		searchInput:  newInput(),
+		commandInput: newInput(),
 	}
 
+	height := 40
 	if len(opts) > 0 {
 		m.showSizes = opts[0].showSizes
 		m.showLineNumbers = opts[0].showLineNumbers
+		if opts[0].height > 0 {
+			height = opts[0].height
+		}
 	}
 
 	tm := teatest.NewTestModel(
 		t, m,
-		teatest.WithInitialTermSize(80, 40),
+		teatest.WithInitialTermSize(80, height),
+		teatest.WithProgramOptions(
+			tea.WithColorProfile(colorprofile.ANSI),
+			// The renderer picks cursor moves by TERM; pin it so the golden
+			// files match on CI, where TERM is unset.
+			tea.WithEnvironment([]string{"TERM=xterm-256color"}),
+		),
 	)
 	return tm
 }
@@ -80,38 +87,60 @@ func TestOutput(t *testing.T) {
 
 	teatest.RequireEqualOutput(t, read(t, tm))
 
-	tm.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	tm.Send(press("q"))
 	tm.WaitFinished(t, teatest.WithFinalTimeout(time.Second))
+}
+
+// TestCursorValueDecodesJsonEscapesInWrappedArrayString verifies that preview
+// and print decode JSON string escapes even after the viewer wraps an array item.
+func TestCursorValueDecodesJsonEscapesInWrappedArrayString(t *testing.T) {
+	head, err := jsonx.Parse([]byte(`["before\ud83d\udd55\nsecond line after"]`))
+	require.NoError(t, err)
+
+	jsonx.Wrap(head, 12)
+	require.NotNil(t, head.Next)
+	require.NotNil(t, head.Next.ChunkEnd)
+
+	m := &model{
+		viewState: viewState{
+			head:   head,
+			cursor: 1,
+		},
+	}
+	require.Equal(t, "before\U0001F555\nsecond line after", m.cursorValue())
+
+	m.cursor = 2
+	require.Equal(t, "before\U0001F555\nsecond line after", m.cursorValue())
 }
 
 func TestNavigation(t *testing.T) {
 	tm := prepare(t)
 
-	tm.Send(tea.KeyMsg{Type: tea.KeyDown})
-	tm.Send(tea.KeyMsg{Type: tea.KeyDown})
-	tm.Send(tea.KeyMsg{Type: tea.KeyDown})
+	tm.Send(press("down"))
+	tm.Send(press("down"))
+	tm.Send(press("down"))
 	teatest.RequireEqualOutput(t, read(t, tm))
 
-	tm.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	tm.Send(press("q"))
 	tm.WaitFinished(t, teatest.WithFinalTimeout(time.Second))
 }
 
 func TestCollapseRecursive(t *testing.T) {
 	tm := prepare(t)
 
-	tm.Send(tea.KeyMsg{Type: tea.KeyShiftLeft})
+	tm.Send(press("shift+left"))
 	teatest.RequireEqualOutput(t, read(t, tm))
 
-	tm.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	tm.Send(press("q"))
 	tm.WaitFinished(t, teatest.WithFinalTimeout(time.Second))
 }
 
 func TestCollapseRecursiveWithSizes(t *testing.T) {
 	tm := prepare(t, options{showSizes: true})
 
-	tm.Send(tea.KeyMsg{Type: tea.KeyShiftLeft})
+	tm.Send(press("shift+left"))
 	teatest.RequireEqualOutput(t, read(t, tm))
 
-	tm.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	tm.Send(press("q"))
 	tm.WaitFinished(t, teatest.WithFinalTimeout(time.Second))
 }

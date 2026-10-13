@@ -1,8 +1,15 @@
 package complete
 
 import (
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
+	"github.com/zxyqq/fx/internal/format"
 	"github.com/zxyqq/fx/internal/jsonx"
 )
 
@@ -71,15 +78,22 @@ func TestKeysComplete(t *testing.T) {
 			want:     []string{".a.b.c"},
 		},
 		{
-			name:     "array returns no keys",
+			name:     "array without objects completes array methods",
 			json:     `[1, 2, 3]`,
-			args:     []string{"fx", "file.json"},
-			compWord: "",
-			want:     nil,
+			args:     []string{"fx", "file.json", ".fla"},
+			compWord: ".fla",
+			want:     []string{".flat", ".flatMap"},
 		},
 		{
-			name:     "primitive value returns no keys",
+			name:     "string completes string methods",
 			json:     `"hello"`,
+			args:     []string{"fx", "file.json", ".toUp"},
+			compWord: ".toUp",
+			want:     []string{".toUpperCase"},
+		},
+		{
+			name:     "boolean has no completions",
+			json:     `true`,
 			args:     []string{"fx", "file.json"},
 			compWord: "",
 			want:     nil,
@@ -229,4 +243,65 @@ func TestKeysComplete_DisplayVsValue(t *testing.T) {
 			}
 		})
 	}
+}
+
+// doCompleteOutput runs doComplete on a file holding json and returns what
+// it prints, one reply per line.
+func doCompleteOutput(t *testing.T, json, words string) []string {
+	return doCompleteFile(t, "file.json", json, "", words)
+}
+
+// doCompleteFile runs doComplete on `fx <flags> <file> <words>`, with a file
+// called name holding content, and returns what it prints, one reply per
+// line.
+func doCompleteFile(t *testing.T, name, content, flags, words string) []string {
+	file := filepath.Join(t.TempDir(), name)
+	require.NoError(t, os.WriteFile(file, []byte(content), 0644))
+
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	stdout := os.Stdout
+	os.Stdout = w
+	line := "fx " + flags + file + " " + words
+	doComplete(line, lastWord(line), false)
+	os.Stdout = stdout
+	require.NoError(t, w.Close())
+	out, err := io.ReadAll(r)
+	require.NoError(t, err)
+	if len(out) == 0 {
+		return nil
+	}
+	return strings.Split(string(out), "\n")
+}
+
+func TestDoComplete_ArrayRewrite(t *testing.T) {
+	json := `{"users": [{"name": 1}, {"age": 2}], "user": {"id": 1}}`
+	// `.users[].name` does not start with the typed `.users.`, but replaces it.
+	require.Equal(t, []string{".users[].name", ".users[].age"}, doCompleteOutput(t, json, ".users."))
+	require.Equal(t, []string{".users", ".user"}, doCompleteOutput(t, json, ".us"))
+	require.Equal(t, []string{"map"}, doCompleteOutput(t, json, "ma"))
+}
+
+func TestDoComplete_Formats(t *testing.T) {
+	// main registers the format flags in Flags; filterArgs needs them.
+	saved := Flags
+	for _, f := range format.All {
+		Flags = append(Flags, Reply{Display: f.Flag, Value: f.Flag, Type: "flag"})
+	}
+	t.Cleanup(func() { Flags = saved })
+
+	want := []string{".zebra", ".alpha"}
+	require.Equal(t, want, doCompleteFile(t, "file.yaml", "zebra: 1\nalpha: 2\n", "", "."))
+	require.Equal(t, want, doCompleteFile(t, "file.toml", "zebra = 1\nalpha = 2\n", "", "."))
+	require.Equal(t, want, doCompleteFile(t, "file.edn", "{:zebra 1 :alpha 2}", "", "."))
+	require.Equal(t, []string{".r.zebra", ".r.alpha"}, doCompleteFile(t, "file.xml", "<r><zebra/><alpha/></r>", "", ".r."))
+	require.Equal(t, []string{".html.head", ".html.body"}, doCompleteFile(t, "file.html", "<p>x</p>", "", ".html."))
+	// A flag wins over the extension.
+	require.Equal(t, want, doCompleteFile(t, "file.txt", "{:zebra 1 :alpha 2}", "--edn ", "."))
+	require.Equal(t, want, doCompleteFile(t, "file.yaml", "zebra = 1\nalpha = 2\n", "--toml ", "."))
+	// Malformed input gives no candidates and does not panic.
+	require.Nil(t, doCompleteFile(t, "file.toml", "a = [1\n", "", "."))
+	require.Nil(t, doCompleteFile(t, "file.edn", "{:a", "", "."))
+	require.Nil(t, doCompleteFile(t, "file.yaml", "a: [1", "", "."))
+	require.Nil(t, doCompleteFile(t, "file.xml", "<a>", "", "."))
 }

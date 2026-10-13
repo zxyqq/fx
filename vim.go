@@ -1,23 +1,8 @@
 package main
 
 import (
-	"strconv"
-
-	tea "github.com/charmbracelet/bubbletea"
-
 	. "github.com/zxyqq/fx/internal/jsonx"
 )
-
-func (m *model) runCommand(s string) (tea.Model, tea.Cmd) {
-	num, err := strconv.Atoi(s)
-	if err == nil {
-		gotoLine(m, num)
-		return m, nil
-	} else if s == "q" {
-		return m, tea.Quit
-	}
-	return m, nil
-}
 
 func gotoLine(m *model, num int) {
 	m.selectNode(findNode(m, num))
@@ -27,6 +12,10 @@ func gotoLine(m *model, num int) {
 }
 
 func findNode(m *model, line int) *Node {
+	if m.top == nil {
+		return nil
+	}
+
 	if line >= m.totalLines {
 		return m.top.Bottom()
 	}

@@ -6,13 +6,26 @@ import (
 	"strconv"
 	"strings"
 
+	tea "charm.land/bubbletea/v2"
+
 	"github.com/zxyqq/fx/internal/ident"
 	. "github.com/zxyqq/fx/internal/jsonx"
 	"github.com/zxyqq/fx/internal/theme"
 	"github.com/zxyqq/fx/internal/utils"
 )
 
-func (m *model) View() string {
+func (m *model) View() tea.View {
+	v := tea.NewView(m.render())
+	v.AltScreen = true
+	if !m.noMouse {
+		v.MouseMode = tea.MouseModeCellMotion
+	}
+	v.WindowTitle = m.fileName // empty for stdin, which leaves the title alone
+	return v
+}
+
+// render draws the screen content.
+func (m *model) render() string {
 	if m.suspending {
 		return ""
 	}
@@ -165,7 +178,7 @@ func (m *model) View() string {
 	} else {
 		statusBarWidth := m.termWidth
 		var indicator string
-		if m.eof {
+		if m.eof && !m.restoring {
 			percent := int(float64(cursorLineNumber) / float64(m.totalLines) * 100)
 			if cursorLineNumber == 1 {
 				percent = min(1, percent)
@@ -181,7 +194,17 @@ func (m *model) View() string {
 		screen = append(screen, theme.CurrentTheme.StatusBar(statusBar)...)
 	}
 
-	if m.yank {
+	if m.confirm != nil {
+		screen = append(screen, '\n')
+		screen = append(screen, m.clip(m.confirm.prompt)...)
+	} else if m.message != nil {
+		screen = append(screen, '\n')
+		text := m.clip(m.message.text)
+		if m.message.isErr {
+			text = theme.CurrentTheme.Error(text)
+		}
+		screen = append(screen, text...)
+	} else if m.yank {
 		screen = append(screen, '\n')
 		screen = append(screen, []byte("(y)value  (p)path  (k)key  (b)key+value")...)
 	} else if m.showShowSelector {
@@ -196,6 +219,13 @@ func (m *model) View() string {
 	} else if m.searchInput.Focused() {
 		screen = append(screen, '\n')
 		screen = append(screen, m.searchInput.View()...)
+	} else if m.queryInput.Focused() {
+		for _, line := range m.completionGridView() {
+			screen = append(screen, '\n')
+			screen = append(screen, line...)
+		}
+		screen = append(screen, '\n')
+		screen = append(screen, m.queryInputView()...)
 	} else if m.searchInput.Value() != "" {
 		screen = append(screen, '\n')
 		re, ci := regexCase(m.searchInput.Value())
@@ -214,6 +244,9 @@ func (m *model) View() string {
 			cursor := fmt.Sprintf("found: [%v/%v]", m.search.cursor+1, len(m.search.results))
 			screen = append(screen, flex(m.termWidth, re, cursor)...)
 		}
+	} else if m.queryInput.Value() != "" {
+		screen = append(screen, '\n')
+		screen = append(screen, m.queryInputView()...)
 	}
 
 	return string(screen)

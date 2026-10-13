@@ -2,19 +2,12 @@ package complete
 
 import (
 	_ "embed"
-	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
-	"github.com/dop251/goja"
-	"github.com/goccy/go-yaml"
-	"github.com/pelletier/go-toml/v2"
-
-	"github.com/zxyqq/fx/internal/engine"
+	"github.com/zxyqq/fx/internal/format"
 	"github.com/zxyqq/fx/internal/jsonx"
 	"github.com/zxyqq/fx/internal/shlex"
 )
@@ -74,14 +67,10 @@ func doComplete(compLine string, compWord string, withDisplay bool) {
 
 	compWord = shlex.Parse(compWord)
 
-	var flagYaml bool
-	var flagToml bool
+	var inputFormat *format.Format
 	for _, arg := range args {
-		if arg == "--yaml" {
-			flagYaml = true
-		}
-		if arg == "--toml" {
-			flagToml = true
+		if f := format.ByFlag(arg); f != nil {
+			inputFormat = f
 		}
 	}
 
@@ -111,14 +100,7 @@ func doComplete(compLine string, compWord string, withDisplay bool) {
 	if isSecondArgIsFile {
 		file := args[1]
 
-		hasYamlExt, _ := regexp.MatchString(`(?i)\.ya?ml$`, file)
-		hasTomlExt, _ := regexp.MatchString(`(?i)\.toml$`, file)
-		if !flagYaml && hasYamlExt {
-			flagYaml = true
-		}
-		if !flagToml && hasTomlExt {
-			flagToml = true
-		}
+		inputFormat = format.Choose(inputFormat, file)
 
 		if strings.HasPrefix(file, "~") {
 			home, err := os.UserHomeDir()
@@ -136,24 +118,12 @@ func doComplete(compLine string, compWord string, withDisplay bool) {
 				return
 			}
 
-			if flagYaml {
-				input, err = yaml.YAMLToJSON(input)
+			if inputFormat != nil {
+				input, err = inputFormat.ToJSON(input)
 				if err != nil {
 					resultCh <- []Reply{}
 					return
 				}
-			} else if flagToml {
-				var v any
-				if err := toml.Unmarshal(input, &v); err != nil {
-					resultCh <- []Reply{}
-					return
-				}
-				b, err := json.Marshal(v)
-				if err != nil {
-					resultCh <- []Reply{}
-					return
-				}
-				input = b
 			}
 
 			node, err := jsonx.Parse(input)
@@ -171,104 +141,23 @@ func doComplete(compLine string, compWord string, withDisplay bool) {
 		case <-time.After(3 * time.Second):
 			return
 		}
+	} else {
+		reply = KeysComplete(nil, args, compWord) // Globals only.
 	}
 
-	reply = filterReply(reply, compWord)
-	if len(reply) > 0 {
-		compReply(reply, withDisplay)
-		return
-	}
-
-	if len(compWord) > 0 {
-		// Only show globals if compWord is not empty,
-		// as we do not want to be very verbose and show all globals.
-		compReply(filterReply(globalsComplete(), compWord), withDisplay)
-	}
+	// Replies already match the word; filtering by prefix would drop the
+	// rewrite of `.items.` to `.items[].key`.
+	compReply(reply, withDisplay)
 }
 
-func globalsComplete() []Reply {
-	var code strings.Builder
-	code.WriteString(prelude)
-	code.WriteString(engine.Stdlib)
-	code.WriteString("\n__autocomplete()\n")
-
-	vm := goja.New()
-	value, err := vm.RunString(code.String())
-	if err != nil {
-		return nil
-	}
-
-	if array, ok := value.Export().([]any); ok {
-		var reply []Reply
-		for _, key := range array {
-			reply = append(reply, Reply{
-				Display: key.(string),
-				Value:   key.(string),
-				Type:    "global",
-			})
-		}
-		return reply
-	}
-	return nil
-}
-
+// KeysComplete completes compWord, the last of the command line args
+// (fx, the file, then the query), on input.
 func KeysComplete(input *jsonx.Node, args []string, compWord string) []Reply {
 	args = args[2:] // Drop binary & file from the args.
-
-	if compWord == "" {
-		args = append(args, ".__keys()")
-	} else {
-		if len(args) > 0 {
-			last := args[len(args)-1]
-			last = dropTail(args[len(args)-1])
-			last = last + ".__keys()"
-			last = balanceBrackets(last)
-			args[len(args)-1] = last
-		}
+	if compWord != "" && len(args) > 0 {
+		args = args[:len(args)-1]
 	}
-
-	var code strings.Builder
-	code.WriteString(prelude)
-	code.WriteString(engine.Stdlib)
-	code.WriteString(engine.JS(args))
-	code.WriteString("\n__main__(json)\n__keys\n")
-
-	vm := goja.New()
-	if err := vm.Set("json", input.ToValue(vm)); err != nil {
-		return nil
-	}
-	value, err := vm.RunString(code.String())
-	if err != nil {
-		return nil
-	}
-
-	if array, ok := value.Export().([]interface{}); ok {
-		prefix := dropTail(compWord)
-		var reply []Reply
-		for _, key := range array {
-			k := key.(string)
-			reply = append(reply, Reply{
-				Display: join("", k),
-				Value:   join(prefix, k),
-				Type:    "key",
-			})
-		}
-		return reply
-	}
-	return nil
-}
-
-var alphaRe = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*$`)
-
-func join(prefix, key string) string {
-	if alphaRe.MatchString(key) {
-		return prefix + "." + key
-	} else {
-		if prefix == "" {
-			return fmt.Sprintf(".[%q]", key)
-		}
-		return fmt.Sprintf("%s[%q]", prefix, key)
-	}
+	return Replies(NewRequest(args, compWord), Docs{First: input})
 }
 
 func filterArgs(args []string) []string {

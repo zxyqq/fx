@@ -16,7 +16,7 @@ func setupVM(t *testing.T) *goja.Runtime {
 	var output []string
 	vm := engine.NewVM(func(s string) {
 		output = append(output, s)
-	})
+	}, false)
 	_, err := vm.RunString(engine.Stdlib)
 	require.NoError(t, err, "Failed to load stdlib")
 	return vm
@@ -27,7 +27,7 @@ func setupVMWithOutput(t *testing.T) (*goja.Runtime, *[]string) {
 	output := &[]string{}
 	vm := engine.NewVM(func(s string) {
 		*output = append(*output, s)
-	})
+	}, false)
 	_, err := vm.RunString(engine.Stdlib)
 	require.NoError(t, err, "Failed to load stdlib")
 	return vm, output
@@ -815,6 +815,84 @@ func TestYAML(t *testing.T) {
 	t.Run("YAML.parse invalid", func(t *testing.T) {
 		_, err := vm.RunString(`YAML.parse('invalid: [unclosed')`)
 		assert.Error(t, err)
+	})
+}
+
+// TestMAML tests MAML.parse and MAML.stringify.
+func TestMAML(t *testing.T) {
+	vm := setupVM(t)
+
+	t.Run("MAML.parse keeps key order", func(t *testing.T) {
+		result, err := vm.RunString(`Object.keys(MAML.parse('{\n  zebra: 1\n  alpha: [1, 2.5, "x"]\n}')).join()`)
+		require.NoError(t, err)
+		assert.Equal(t, "zebra,alpha", result.String())
+	})
+
+	t.Run("MAML.parse values", func(t *testing.T) {
+		result, err := vm.RunString(`MAML.parse('{a: [1, 2.5, "x", true, null], b: """\nraw"""}')`)
+		require.NoError(t, err)
+		expected := map[string]interface{}{
+			"a": []interface{}{int64(1), 2.5, "x", true, nil},
+			"b": "raw",
+		}
+		assert.Equal(t, expected, result.Export())
+	})
+
+	t.Run("MAML.parse invalid", func(t *testing.T) {
+		_, err := vm.RunString(`MAML.parse('{a:')`)
+		assert.ErrorContains(t, err, "Unexpected end of input on line 1.")
+	})
+
+	t.Run("MAML.stringify", func(t *testing.T) {
+		result, err := vm.RunString(`MAML.stringify({name: 'John', "a b": [1, 2**60, 1.5, -0, null, true], n: {}, inf: Infinity, u: undefined})`)
+		require.NoError(t, err)
+		expected := `{
+  name: "John"
+  "a b": [
+    1
+    1152921504606846976
+    1.5
+    -0
+    null
+    true
+  ]
+  n: {}
+  inf: null
+  u: null
+}`
+		assert.Equal(t, expected, result.String())
+	})
+
+	t.Run("MAML.stringify bigint", func(t *testing.T) {
+		result, err := vm.RunString(`MAML.stringify([2n**62n])`)
+		require.NoError(t, err)
+		assert.Equal(t, "[\n  4611686018427387904\n]", result.String())
+
+		_, err = vm.RunString(`MAML.stringify(2n**64n)`)
+		assert.ErrorContains(t, err, "outside the 64-bit integer range")
+	})
+
+	t.Run("MAML.parse big integers", func(t *testing.T) {
+		result, err := vm.RunString(`const big = MAML.parse('[9007199254740991, 9007199254740993, -9223372036854775808]'); [typeof big[0], typeof big[1], String(big[1]), String(big[2])].join()`)
+		require.NoError(t, err)
+		assert.Equal(t, "number,bigint,9007199254740993,-9223372036854775808", result.String())
+	})
+
+	t.Run("MAML.stringify circular", func(t *testing.T) {
+		_, err := vm.RunString(`(() => { const a = {b: [1]}; a.b.push(a); return MAML.stringify(a) })()`)
+		assert.ErrorContains(t, err, "MAML.stringify: converting circular structure")
+	})
+
+	t.Run("MAML.stringify shared value", func(t *testing.T) {
+		result, err := vm.RunString(`(() => { const s = {x: 1}; return MAML.stringify({a: s, b: [s]}) })()`)
+		require.NoError(t, err)
+		assert.Equal(t, "{\n  a: {\n    x: 1\n  }\n  b: [\n    {\n      x: 1\n    }\n  ]\n}", result.String())
+	})
+
+	t.Run("MAML round trip", func(t *testing.T) {
+		result, err := vm.RunString(`JSON.stringify(MAML.parse(MAML.stringify({b: "x\ny", a: [{c: 1}]})))`)
+		require.NoError(t, err)
+		assert.Equal(t, `{"b":"x\ny","a":[{"c":1}]}`, result.String())
 	})
 }
 

@@ -9,39 +9,40 @@ import (
 	"io"
 	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime/pprof"
 	"strconv"
 	"strings"
 
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/spinner"
+	"charm.land/bubbles/v2/textinput"
+	"charm.land/bubbles/v2/viewport"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/zxyqq/clipboard"
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/spinner"
-	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-isatty"
 
 	"github.com/zxyqq/fx/internal/complete"
+	"github.com/zxyqq/fx/internal/dungeon"
 	"github.com/zxyqq/fx/internal/engine"
+	"github.com/zxyqq/fx/internal/format"
 	"github.com/zxyqq/fx/internal/fuzzy"
 	"github.com/zxyqq/fx/internal/jsonpath"
 	. "github.com/zxyqq/fx/internal/jsonx"
+	"github.com/zxyqq/fx/internal/pretty"
 	"github.com/zxyqq/fx/internal/theme"
-	"github.com/zxyqq/fx/internal/toml"
 	"github.com/zxyqq/fx/internal/utils"
 )
 
 var (
-	flagYaml     bool
-	flagToml     bool
+	inputFormat  *format.Format // nil: JSON, or raw lines with flagRaw
 	flagRaw      bool
 	flagSlurp    bool
 	flagComp     bool
 	flagStrict   bool
 	flagNoInline bool
+	flagNoTUI    bool
 )
 
 var flags = []string{
@@ -50,15 +51,18 @@ var flags = []string{
 	"--slurp",
 	"--themes",
 	"--version",
-	"--yaml",
-	"--toml",
 	"--strict",
 	"--no-inline",
+	"--no-tui",
+	"--dungeon",
 }
 
 func init() {
+	for _, f := range format.All {
+		flags = append(flags, f.Flag)
+	}
 	for _, name := range flags {
-		complete.Flags = append(complete.Flags, complete.Reply{name, name, "flag"})
+		complete.Flags = append(complete.Flags, complete.Reply{Display: name, Value: name, Type: "flag"})
 	}
 }
 
@@ -87,55 +91,33 @@ func main() {
 		return
 	}
 
-	var args []string
-	for _, arg := range os.Args[1:] {
-		if strings.HasPrefix(arg, "--comp") {
-			flagComp = true
-			continue
-		}
-		switch arg {
-		case "-h", "--help":
-			fmt.Println(usage())
-			return
-		case "-v", "-V", "--version":
-			fmt.Println(version)
-			return
-		case "--themes":
-			theme.ThemeTester()
-			return
-		case "--export-themes":
-			theme.ExportThemes()
-			return
-		case "--yaml":
-			flagYaml = true
-		case "--toml":
-			flagToml = true
-		case "--raw", "-r":
-			flagRaw = true
-		case "--slurp", "-s":
-			flagSlurp = true
-		case "-rs", "-sr":
-			flagRaw = true
-			flagSlurp = true
-		case "--strict":
-			flagStrict = true
-		case "--no-inline":
-			flagNoInline = true
-		case "--game-of-life":
-			utils.GameOfLife()
-			return
-		default:
-			args = append(args, arg)
-		}
-	}
-
-	if (flagYaml || flagToml) && flagRaw {
-		println("Error: can't use --yaml/--toml and --raw flags together")
+	args, act, err := parseFlags(os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
-	if flagYaml && flagToml {
-		println("Error: can't use both --yaml and --toml flags together")
-		os.Exit(1)
+	if _, ok := os.LookupEnv("FX_NO_TUI"); ok {
+		flagNoTUI = true
+	}
+	switch act {
+	case actionHelp:
+		lipgloss.Println(usage())
+		return
+	case actionVersion:
+		fmt.Println(version)
+		return
+	case actionThemes:
+		theme.ThemeTester()
+		return
+	case actionExportThemes:
+		theme.ExportThemes()
+		return
+	case actionDungeon:
+		if err := dungeon.Run(); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	if flagComp {
@@ -157,83 +139,132 @@ func main() {
 	fd := os.Stdin.Fd()
 	stdinIsTty := isatty.IsTerminal(fd) || isatty.IsCygwinTerminal(fd)
 
+	// Check if stdin is actually piped/redirected input, not just non-TTY
+	// Default to false (treat as file/code mode) if we can't stat stdin
+	stdinIsInput := false
+	if stat, err := os.Stdin.Stat(); err == nil {
+		// ModeCharDevice is 0 for regular files and pipes, meaning actual data
+		stdinIsInput = (stat.Mode() & os.ModeCharDevice) == 0
+	}
+
 	var fileName string
 	var src io.Reader
+	var file io.Closer // nil for stdin
 
-	if stdinIsTty {
-		if len(args) == 0 {
-			// $ fx
-			fmt.Println(usage())
-			return
-		} else {
-			// $ fx file.json arg*
-			filePath := args[0]
-			src = open(filePath, &flagYaml, &flagToml)
-			engine.FilePath = filePath
-			fileName = filepath.Base(filePath)
-			args = args[1:]
+	switch chooseInput(stdinIsTty, stdinIsInput, args, os.Stat) {
+	case inputUsage:
+		// $ fx
+		lipgloss.Println(usage())
+		return
+	case inputFile:
+		// $ fx file.json arg*
+		filePath := args[0]
+		f := open(filePath)
+		if !flagRaw {
+			// --raw wins over the extension, like an explicit format flag.
+			inputFormat = format.Choose(inputFormat, filePath)
 		}
-	} else {
+		src = f
+		file = f
+		engine.FilePath = filePath
+		switch {
+		case flagRaw:
+			engine.FileFormat = "raw text"
+		case inputFormat != nil:
+			engine.FileFormat = strings.ToUpper(inputFormat.Name)
+		}
+		engine.SetInput(f)
+		fileName = filepath.Base(filePath)
+		args = args[1:]
+	case inputStdin:
 		// cat file.json | fx arg*
 		src = os.Stdin
 	}
 
-	var parser engine.Parser
+	parser, err := newParser(src)
+	if err != nil {
+		fmt.Print(err.Error())
+		os.Exit(1)
+		return
+	}
 
-	if flagYaml {
-		b, err := io.ReadAll(src)
-		if err != nil {
-			panic(err)
-		}
-		jsonBytes, err := parseYAML(b)
-		if err != nil {
-			fmt.Print(err.Error())
-			os.Exit(1)
-			return
-		}
-		parser = NewJsonParser(bytes.NewReader(jsonBytes), flagStrict)
-	} else if flagToml {
-		b, err := io.ReadAll(src)
-		if err != nil {
-			panic(err)
-		}
-		jsonBytes, err := toml.ToJSON(b)
-		if err != nil {
-			fmt.Print(err.Error())
-			os.Exit(1)
-			return
-		}
-		parser = NewJsonParser(bytes.NewReader(jsonBytes), flagStrict)
-	} else if flagRaw {
-		parser = NewLineParser(src)
-	} else {
-		parser = NewJsonParser(src, flagStrict)
+	if flagNoTUI && len(args) == 0 {
+		// Print the input instead of opening the viewer.
+		args = []string{"."}
 	}
 
 	if len(args) > 0 || flagSlurp {
-		opts := engine.Options{
-			Slurp:      flagSlurp,
-			WithInline: !flagNoInline,
-			WriteOut:   func(s string) { fmt.Println(s) },
-			WriteErr:   func(s string) { fmt.Fprintln(os.Stderr, s) },
+		var err error
+
+		if !flagRaw && inputFormat == nil && !flagSlurp {
+			parser = &nonEmptyParser{Parser: parser}
 		}
-		exitCode := engine.Start(parser, args, opts)
+
+		if flagSlurp {
+			parser, err = engine.Slurp(parser)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+		}
+
+		out := make(chan *Node)
+		errCh := make(chan error)
+		cancel := make(chan struct{})
+
+		// Single consumer keeps stdout/stderr order identical to engine order.
+		done := make(chan int)
+		go func() {
+			done <- engine.Start(parser, args, out, errCh, cancel)
+		}()
+
+		var exitCode int
+		failed := false
+	loop:
+		for {
+			select {
+			case node := <-out:
+				if node.Kind == String {
+					// Only an input string, on the fast path, may be invalid.
+					unquoted, err := utils.Unquote(node.Value)
+					if err != nil {
+						fmt.Fprintln(os.Stderr, InvalidString(node.Value))
+						failed = true
+						continue
+					}
+					fmt.Println(unquoted)
+				} else {
+					lipgloss.Println(pretty.Print(node, !flagNoInline))
+				}
+			case err := <-errCh:
+				fmt.Fprintln(os.Stderr, err)
+			case exitCode = <-done:
+				break loop
+			}
+		}
+
+		if exitCode == 0 && failed {
+			exitCode = 1
+		}
 		if exitCode != 0 {
 			os.Exit(exitCode)
 		}
 		return
 	}
 
-	commandInput := textinput.New()
+	queryInput := newInput()
+	queryInput.Prompt = ""
+
+	commandInput := newInput()
 	commandInput.Prompt = ":"
 
-	searchInput := textinput.New()
+	searchInput := newInput()
 	searchInput.Prompt = "/"
 
-	gotoSymbolInput := textinput.New()
+	gotoSymbolInput := newInput()
 	gotoSymbolInput.Prompt = "@"
 
-	previewSearchInput := textinput.New()
+	previewSearchInput := newInput()
 	previewSearchInput.Prompt = "/"
 
 	spinnerModel := spinner.New()
@@ -264,55 +295,32 @@ func main() {
 		showSizes:           showSizes,
 		showLineNumbers:     showLineNumbers,
 		fileName:            fileName,
+		queryInput:          queryInput,
 		gotoSymbolInput:     gotoSymbolInput,
 		commandInput:        commandInput,
 		searchInput:         searchInput,
-		search:              newSearch(),
+		viewState:           viewState{search: newSearch()},
 		previewSearchInput:  previewSearchInput,
 		previewSearchCursor: -1,
 		spinner:             spinnerModel,
 	}
 
-	lipgloss.SetColorProfile(theme.TermOutput.ColorProfile())
-
-	withMouse := tea.WithMouseCellMotion()
 	if _, ok := os.LookupEnv("FX_NO_MOUSE"); ok {
-		withMouse = tea.WithAltScreen()
+		m.noMouse = true
 	}
+	_, sshConn := os.LookupEnv("SSH_CONNECTION")
+	_, sshTTY := os.LookupEnv("SSH_TTY")
+	m.sshSession = sshConn || sshTTY
 
 	p := tea.NewProgram(m,
-		tea.WithAltScreen(),
-		withMouse,
 		tea.WithOutput(os.Stderr),
+		tea.WithColorProfile(theme.Profile),
 	)
 
-	go func() {
-		firstOk := false
-		for {
-			node, err := parser.Parse()
-			if err != nil {
-				if err == io.EOF {
-					p.Send(eofMsg{})
-					break
-				}
-				if flagStrict {
-					p.Send(errorMsg{err: err})
-					break
-				}
-				textNode := parser.Recover()
-				if !firstOk && !strings.HasPrefix(textNode.Value, "HTTP") {
-					p.Send(errorMsg{err: err})
-					break
-				}
-				p.Send(nodeMsg{node: textNode})
-			} else {
-				firstOk = true
-				p.Send(nodeMsg{node: node})
-			}
-		}
-	}()
+	m.rawModeOnEOF = !stdinIsTty
+	m.loader = newLoader(0, file, func() (engine.Parser, error) { return parser, nil })
 
-	_, err := p.Run()
+	_, err = p.Run()
 	if err != nil {
 		panic(err)
 	}
@@ -326,11 +334,23 @@ func main() {
 	}
 }
 
+// newInput returns a text input with no colors of its own: the prompt and
+// text take the terminal's colors and the cursor is a reverse-video block.
+func newInput() textinput.Model {
+	in := textinput.New()
+	st := in.Styles()
+	st.Focused.Prompt = lipgloss.NewStyle()
+	st.Blurred.Prompt = lipgloss.NewStyle()
+	st.Blurred.Text = lipgloss.NewStyle()
+	st.Cursor.Color = nil
+	in.SetStyles(st)
+	return in
+}
+
 type model struct {
+	viewState
 	termWidth, termHeight int
-	head, top, bottom     *Node
 	eof                   bool
-	cursor                int // cursor position [0, termHeight)
 	suspending            bool
 	showCursor            bool
 	wrap                  bool
@@ -338,15 +358,27 @@ type model struct {
 	showShowSelector      bool
 	showSizes             bool
 	showLineNumbers       bool
-	totalLines            int
+	noMouse               bool // FX_NO_MOUSE: leave the mouse to the terminal
+	sshSession            bool // the clipboard tool would reach the wrong machine
 	fileName              string
+	queryInput            textinput.Model
+	queryInputOffset      int        // first rune of the query shown, when it is wider than the input
+	query                 *queryRun  // running or last finished query, nil if none
+	original              *savedView // saved original view while a query result is shown
+	runningQueries        int        // engine goroutines still reading the original
+	restoring             bool       // waiting for runningQueries to reach zero to restore the original
+	livePreview           *queryRun  // running live preview, nil if none
+	previewSeq            uint64     // increments with each keystroke to debounce previews
+	queryHistory          []string   // applied queries, oldest first
+	queryHistoryIndex     int        // browsed entry; len(queryHistory) means the draft
+	queryHistoryDraft     string     // text typed before browsing history
+	completion            completion // autocompletion of the query input
 	gotoSymbolInput       textinput.Model
 	commandInput          textinput.Model
 	searchInput           textinput.Model
-	search                *search
-	searching             bool          // search in progress
-	searchCancel          chan struct{} // cancel channel for search
-	searchID              uint64        // increments with each search to detect stale results
+	searching             bool       // search in progress
+	searchRun             *searchRun // the search running in the background
+	searchID              uint64     // increments with each search to detect stale results
 	yank                  bool
 	showHelp              bool
 	help                  viewport.Model
@@ -359,12 +391,29 @@ type model struct {
 	printOnExit           bool
 	printErrorOnExit      error
 	spinner               spinner.Model
-	locationHistory       []location
-	locationIndex         int // position in locationHistory
-	keysIndex             []string
-	keysIndexNodes        []*Node
-	fuzzyMatch            *fuzzy.Match
 	deletePending         bool
+	confirm               *confirmation // yes/no question in the command line, nil if none
+	message               *message      // shown in the command line until the next key press
+	rawModeOnEOF          bool          // stdin is piped, reapply raw mode once it is read
+	loader                *loader       // reads the input, replaced on reload
+	loadGen               uint64        // generation of loader, stale messages are dropped
+	loadErr               error         // why the last reload failed, nil if the input is complete
+	reloadPos             *reloadPos    // cursor position to restore after reload, nil if none
+}
+
+// viewState is the part of the model describing the displayed node list.
+// While a query result is shown, the original's viewState is saved aside.
+type viewState struct {
+	head, top, bottom *Node
+	cursor            int // cursor position [0, termHeight)
+	totalLines        int
+	locationHistory   []location
+	locationIndex     int // position in locationHistory
+	search            *search
+	keysIndex         []string
+	keysIndexNodes    []*Node
+	fuzzyMatch        *fuzzy.Match
+	queryErrors       map[*Node]struct{} // error lines in a query result
 }
 
 type location struct {
@@ -372,15 +421,21 @@ type location struct {
 	node *Node
 }
 
+// nodeMsg, errorMsg and eofMsg carry the generation of the loader that
+// read them; messages of a loader replaced by reload are stale.
 type nodeMsg struct {
 	node *Node
+	gen  uint64
 }
 
 type errorMsg struct {
 	err error
+	gen uint64
 }
 
-type eofMsg struct{}
+type eofMsg struct {
+	gen uint64
+}
 
 type searchResultMsg struct {
 	id     uint64
@@ -393,59 +448,97 @@ type searchCancelledMsg struct {
 }
 
 func (m *model) Init() tea.Cmd {
-	return m.spinner.Tick
+	return tea.Batch(m.spinner.Tick, m.loader.wait())
 }
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	defer m.repairHead()
+	switch msg.(type) {
+	case tea.KeyPressMsg, tea.MouseClickMsg, tea.WindowSizeMsg:
+		// A search in the background reads the list, which these may edit.
+		// The user searches again.
+		m.cancelSearch()
+	}
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.termWidth = msg.Width
 		m.termHeight = msg.Height
-		m.help.Width = m.termWidth
-		m.help.Height = m.termHeight - 1
-		m.preview.Width = m.termWidth
-		m.preview.Height = m.termHeight - 1
-		Wrap(m.top, m.viewWidth())
+		m.help.SetWidth(m.termWidth)
+		m.help.SetHeight(m.termHeight - 1)
+		m.preview.SetWidth(m.termWidth)
+		m.preview.SetHeight(m.termHeight - 1)
+		if m.wrap {
+			Wrap(m.top, m.viewWidth())
+		}
+		m.repairHead()
 		m.redoSearch()
 
 	case eofMsg:
-		m.eof = true
+		if msg.gen != m.loadGen {
+			return m, nil
+		}
+		m.setEOF()
+		if m.rawModeOnEOF {
+			// Reapply raw mode after the process piping to fx exits. Done
+			// inside Update so it can't race with bubbletea restoring the
+			// terminal on exit.
+			m.rawModeOnEOF = false
+			reapplyRawMode()
+		}
 		return m, nil
 
 	case errorMsg:
+		if msg.gen != m.loadGen {
+			return m, nil
+		}
+		if m.loadGen > 0 {
+			// A reloaded file may be mid-write; keep fx open to reload again.
+			m.showReloadError(msg.err)
+			return m, nil
+		}
 		m.printErrorOnExit = msg.err
 		return m, tea.Quit
 
 	case nodeMsg:
-		if m.wrap {
-			Wrap(msg.node, m.viewWidth())
+		if msg.gen != m.loadGen {
+			return m, nil
 		}
-		if m.collapsed {
-			msg.node.CollapseRecursively()
+		if m.original != nil {
+			m.appendOriginal(msg.node)
+			return m, tea.Batch(m.completionDocsArrived(), m.loader.wait())
 		}
+		m.appendNode(msg.node)
 		m.totalLines = msg.node.Bottom().LineNumber
+		m.restoreReloadPosition(msg.node)
+		return m, tea.Batch(m.completionDocsArrived(), m.loader.wait())
 
-		if m.head == nil {
-			m.head = msg.node
-			m.top = msg.node
-			m.bottom = msg.node
-		} else {
-			to, ok := m.cursorPointsTo()
-			if !ok {
-				return m, nil
-			}
-			scrollToBottom := to == m.bottom.Bottom()
-			msg.node.Index = -1 // To fix the statusbar path (to show .key instead of [0].key).
-			m.bottom.Adjacent(msg.node)
-			m.bottom = msg.node
-			if scrollToBottom {
-				m.scrollToBottom()
-			}
-		}
+	case queryResultMsg:
+		return m, m.handleQueryResult(msg)
+
+	case queryErrorMsg:
+		return m, m.handleQueryError(msg)
+
+	case queryDoneMsg:
+		return m, m.handleQueryDone(msg)
+
+	case shellDoneMsg:
+		return m, m.shellDone(msg)
+
+	case previewTickMsg:
+		return m, m.handlePreviewTick(msg)
+
+	case completeTickMsg:
+		return m, m.handleCompleteTick(msg)
+
+	case completeEngineMsg:
+		m.handleCompleteEngine(msg)
 		return m, nil
 
+	case completeStreamMsg:
+		return m, m.handleCompleteStream()
+
 	case spinner.TickMsg:
-		if !m.eof || m.searching {
+		if !m.eof || m.searching || m.restoring {
 			var cmd tea.Cmd
 			m.spinner, cmd = m.spinner.Update(msg)
 			return m, cmd
@@ -456,7 +549,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.searching = false
-		m.searchCancel = nil
+		m.searchRun = nil
 		if msg.search != nil {
 			m.search = msg.search
 			m.selectSearchResult(0)
@@ -468,7 +561,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.searching = false
-		m.searchCancel = nil
+		m.searchRun = nil
 		return m, nil
 
 	case tea.ResumeMsg:
@@ -485,17 +578,22 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
-	case tea.MouseMsg:
-		m.handlePendingDelete(msg)
-
-		switch {
-		case msg.Button == tea.MouseButtonWheelUp:
+	case tea.MouseWheelMsg:
+		if !m.mouseEvent(msg) {
+			return m, nil
+		}
+		switch msg.Button {
+		case tea.MouseWheelUp:
 			m.up()
-
-		case msg.Button == tea.MouseButtonWheelDown:
+		case tea.MouseWheelDown:
 			m.down()
+		}
 
-		case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress:
+	case tea.MouseClickMsg:
+		if !m.mouseEvent(msg) {
+			return m, nil
+		}
+		if msg.Button == tea.MouseLeft {
 			m.showCursor = true
 			if msg.Y < m.viewHeight() {
 				if m.cursor == msg.Y {
@@ -529,9 +627,24 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-	case tea.KeyMsg:
+	case tea.PasteMsg:
+		return m, m.handlePaste(msg)
+
+	case tea.KeyPressMsg:
+		m.message = nil
+		// Quit on Ctrl-C, no matter what.
+		if key.Matches(msg, ctrlC) {
+			return m, tea.Quit
+		}
+
+		if m.confirm != nil {
+			return m.handleConfirmKey(msg)
+		}
+		if m.queryInput.Focused() {
+			return m.handleQueryKey(msg)
+		}
 		if m.commandInput.Focused() {
-			return m.handleGotoLineKey(msg)
+			return m.handleCommandKey(msg)
 		}
 		if m.searchInput.Focused() {
 			return m.handleSearchKey(msg)
@@ -550,11 +663,102 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// mouseEvent does the bookkeeping shared by all mouse messages and reports
+// whether the event should be handled. A pending question swallows it.
+func (m *model) mouseEvent(msg tea.Msg) bool {
+	if m.confirm != nil {
+		return false // Only a key answers the question.
+	}
+	m.reloadPos = nil // The user moved on, don't jump back.
+	m.message = nil
+	m.handlePendingDelete(msg)
+	return true
+}
+
+func (m *model) handleQueryKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+	switch {
+	case msg.String() == "esc":
+		// Cancel like search: drop the query and restore the original.
+		m.showCursor = true
+		m.queryInput.Blur()
+		m.cancelPreview()
+		m.stopCompletion()
+		m.queryInput.SetValue("")
+		cmd = m.clearQuery()
+
+	case msg.String() == "enter":
+		m.showCursor = true
+		m.queryInput.Blur()
+		m.cancelPreview()
+		m.stopCompletion()
+		m.addQueryHistory(m.queryInput.Value())
+		cmd = m.doQuery(m.queryInput.Value())
+
+	case msg.String() == "up":
+		m.queryHistoryPrev()
+		cmd = m.updateCompletion()
+
+	case msg.String() == "down":
+		m.queryHistoryNext()
+		cmd = m.updateCompletion()
+
+	case msg.String() == "tab":
+		cmd = m.completeKey(+1)
+
+	case msg.String() == "shift+tab":
+		cmd = m.completeKey(-1)
+
+	default:
+		if msg.String() == "right" || msg.String() == "end" || msg.String() == "ctrl+e" {
+			if cmd, ok := m.acceptGhost(); ok {
+				return m, cmd
+			}
+		}
+		cmd = m.editQuery(msg)
+	}
+	return m, cmd
+}
+
+// editQuery passes msg to the query input and schedules the preview and
+// completion updates the edit calls for.
+func (m *model) editQuery(msg tea.Msg) tea.Cmd {
+	before, pos := m.queryInput.Value(), m.queryInput.Position()
+	var cmd tea.Cmd
+	m.queryInput, cmd = m.queryInput.Update(msg)
+	if m.queryInput.Value() != before {
+		cmd = tea.Batch(cmd, m.schedulePreview())
+	}
+	if m.queryInput.Value() != before || m.queryInput.Position() != pos || m.completion.menu {
+		cmd = tea.Batch(cmd, m.updateCompletion())
+	}
+	return cmd
+}
+
+// handlePaste inserts pasted text into the focused input, if any.
+func (m *model) handlePaste(msg tea.PasteMsg) tea.Cmd {
+	if m.confirm != nil {
+		return nil
+	}
+	var cmd tea.Cmd
+	switch {
+	case m.queryInput.Focused():
+		cmd = m.editQuery(msg)
+	case m.commandInput.Focused():
+		m.commandInput, cmd = m.commandInput.Update(msg)
+	case m.searchInput.Focused():
+		m.searchInput, cmd = m.searchInput.Update(msg)
+	case m.gotoSymbolInput.Focused():
+		cmd = m.editGotoSymbol(msg)
+	}
+	return cmd
+}
+
 func (m *model) handleHelpKey(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
-	if msg, ok := msg.(tea.KeyMsg); ok {
+	if msg, ok := msg.(tea.KeyPressMsg); ok {
 		switch {
-		case key.Matches(msg, keyMap.Quit), key.Matches(msg, keyMap.Help):
+		case key.Matches(msg, keyMap.Quit), key.Matches(msg, keyMap.Help), key.Matches(msg, escKey):
 			m.showHelp = false
 		}
 	}
@@ -562,15 +766,15 @@ func (m *model) handleHelpKey(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m *model) handleGotoLineKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *model) handleCommandKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	switch {
-	case msg.Type == tea.KeyEscape:
+	case msg.String() == "esc":
 		m.commandInput.Blur()
 		m.commandInput.SetValue("")
 		m.showCursor = true
 
-	case msg.Type == tea.KeyEnter:
+	case msg.String() == "enter":
 		m.commandInput.Blur()
 		command := m.commandInput.Value()
 		m.commandInput.SetValue("")
@@ -582,17 +786,17 @@ func (m *model) handleGotoLineKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m *model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *model) handleSearchKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	switch {
-	case msg.Type == tea.KeyEscape:
+	case msg.String() == "esc":
 		m.cancelSearch()
 		m.search = newSearch()
 		m.searchInput.Blur()
 		m.searchInput.SetValue("")
 		m.showCursor = true
 
-	case msg.Type == tea.KeyEnter:
+	case msg.String() == "enter":
 		m.searchInput.Blur()
 		m.cancelSearch()
 		m.search = newSearch()
@@ -604,60 +808,85 @@ func (m *model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m *model) handleGotoSymbolKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *model) handleGotoSymbolKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
-	switch msg.Type {
-	case tea.KeyEscape, tea.KeyEnter, tea.KeyUp, tea.KeyDown:
+	switch msg.String() {
+	case "esc", "enter", "up", "down":
 		m.gotoSymbolInput.Blur()
 		m.gotoSymbolInput.SetValue("")
 		m.recordHistory()
 
 	default:
-		m.gotoSymbolInput, cmd = m.gotoSymbolInput.Update(msg)
-		pattern := []rune(m.gotoSymbolInput.Value())
-		found := fuzzy.Find(pattern, m.keysIndex)
-		if found != nil {
-			m.fuzzyMatch = found
-			m.selectNode(m.keysIndexNodes[found.Index])
-		}
+		cmd = m.editGotoSymbol(msg)
 	}
 
-	switch msg.Type {
-	case tea.KeyUp:
+	switch msg.String() {
+	case "up":
 		m.up()
 
-	case tea.KeyDown:
+	case "down":
 		m.down()
 	}
 
 	return m, cmd
 }
 
-func (m *model) handleYankKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch {
-	case key.Matches(msg, yankPath):
-		_ = clipboard.WriteAll(m.cursorPath())
-	case key.Matches(msg, yankKey):
-		_ = clipboard.WriteAll(m.cursorKey())
-	case key.Matches(msg, yankValueY, yankValueV):
-		_ = clipboard.WriteAll(m.cursorValue())
-	case key.Matches(msg, yankKeyValue):
-		k := m.cursorKey()
-		v := m.cursorValue()
-		keyValue := k + ": " + v
-		_ = clipboard.WriteAll(keyValue)
+// editGotoSymbol passes msg to the goto-symbol input and jumps to the best
+// fuzzy match of its value.
+func (m *model) editGotoSymbol(msg tea.Msg) tea.Cmd {
+	var cmd tea.Cmd
+	m.gotoSymbolInput, cmd = m.gotoSymbolInput.Update(msg)
+	pattern := []rune(m.gotoSymbolInput.Value())
+	found := fuzzy.Find(pattern, m.keysIndex)
+	if found != nil {
+		m.fuzzyMatch = found
+		m.selectNode(m.keysIndexNodes[found.Index])
 	}
-	m.yank = false
-	return m, nil
+	return cmd
 }
 
-func (m *model) handleShowSelectorKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *model) handleYankKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+	switch {
+	case key.Matches(msg, yankPath):
+		cmd = m.copy(m.cursorPath())
+	case key.Matches(msg, yankKey):
+		cmd = m.copy(m.cursorKey())
+	case key.Matches(msg, yankValueY, yankValueV):
+		cmd = m.copy(m.cursorValue())
+	case key.Matches(msg, yankKeyValue):
+		cmd = m.copy(m.cursorKey() + ": " + m.cursorValue())
+	}
+	m.yank = false
+	return m, cmd
+}
+
+// copy puts text on the clipboard. OSC52 goes to the terminal the user looks
+// at, so it works over ssh and in sandboxes; locally the system clipboard
+// tool is also used, for terminals without OSC52.
+func (m *model) copy(text string) tea.Cmd {
+	cmds := []tea.Cmd{tea.SetClipboard(text)}
+	if !m.sshSession {
+		// Off the event loop: the tool may be slow to start or to fail.
+		cmds = append(cmds, func() tea.Msg {
+			_ = clipboard.WriteAll(text)
+			return nil
+		})
+	}
+	return tea.Batch(cmds...)
+}
+
+func (m *model) handleShowSelectorKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, showSizes):
 		m.showSizes = !m.showSizes
 	case key.Matches(msg, showLineNumbers):
 		m.showLineNumbers = !m.showLineNumbers
-		Wrap(m.top, m.viewWidth())
+		if m.wrap {
+			// The line numbers take width from the strings.
+			Wrap(m.top, m.viewWidth())
+		}
+		m.redoSearch()
 	}
 	m.showShowSelector = false
 	return m, nil
@@ -666,7 +895,7 @@ func (m *model) handleShowSelectorKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *model) handlePendingDelete(msg tea.Msg) {
 	// Handle potential 'dd' sequence for delete
 	if m.deletePending {
-		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+		if keyMsg, ok := msg.(tea.KeyPressMsg); ok {
 			if key.Matches(keyMsg, keyMap.Delete) {
 				m.deleteAtCursor()
 				m.deletePending = true
@@ -677,7 +906,8 @@ func (m *model) handlePendingDelete(msg tea.Msg) {
 	}
 }
 
-func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	m.reloadPos = nil // The user moved on, don't jump back.
 	m.handlePendingDelete(msg)
 
 	switch {
@@ -721,6 +951,16 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.showCursor = true
 		m.scrollForward(m.viewHeight() / 2)
 		m.scrollIntoView() // As the cursor stays at the same position, and it may be empty.
+		m.recordHistory()
+
+	case key.Matches(msg, keyMap.ScrollUp):
+		m.showCursor = true
+		m.scrollUp()
+		m.recordHistory()
+
+	case key.Matches(msg, keyMap.ScrollDown):
+		m.showCursor = true
+		m.scrollDown()
 		m.recordHistory()
 
 	case key.Matches(msg, keyMap.GotoTop):
@@ -771,6 +1011,28 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if prevSibling != nil {
 			m.selectNode(prevSibling)
+		}
+		m.recordHistory()
+
+	case key.Matches(msg, keyMap.MatchBracket):
+		pointsTo, ok := m.cursorPointsTo()
+		if !ok {
+			return m, nil
+		}
+		if pointsTo.Chunk != "" && pointsTo.Parent != nil && pointsTo.Parent.ChunkEnd != nil {
+			pointsTo = pointsTo.Parent // Wrapped string chunk.
+		}
+		var match *Node
+		parent := pointsTo.Parent
+		if pointsTo.End != nil {
+			match = pointsTo.End
+		} else if parent != nil && parent.End == pointsTo {
+			match = parent
+		} else if parent != nil {
+			match = parent.End
+		}
+		if match != nil {
+			m.selectNode(match)
 		}
 		m.recordHistory()
 
@@ -832,6 +1094,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					n = n.End.Next
 				}
 			}
+			m.repairHead()
 			m.selectNode(at.Root())
 			m.recordHistory()
 		}
@@ -873,6 +1136,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			DropWrapAll(m.top)
 		}
+		m.repairHead()
 		if at.Chunk != "" && at.Value == "" {
 			at = at.Parent
 		}
@@ -908,12 +1172,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, keyMap.Print):
 		return m, m.print()
 
-	case key.Matches(msg, keyMap.Open):
-		return m, m.open()
+	case key.Matches(msg, keyMap.Reload):
+		return m, m.reload()
 
 	case key.Matches(msg, keyMap.GotoSymbol):
 		m.gotoSymbolInput.CursorEnd()
-		m.gotoSymbolInput.Width = m.termWidth - 2 // -1 for the prompt, -1 for the cursor
+		m.gotoSymbolInput.SetWidth(m.termWidth - 2) // -1 for the prompt, -1 for the cursor
 		m.gotoSymbolInput.Focus()
 		m.createKeysIndex()
 
@@ -933,12 +1197,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, keyMap.CommandLine):
 		m.commandInput.CursorEnd()
-		m.commandInput.Width = m.termWidth - 2 // -1 for the prompt, -1 for the cursor
+		m.commandInput.SetWidth(m.termWidth - 2) // -1 for the prompt, -1 for the cursor
 		m.commandInput.Focus()
 
 	case key.Matches(msg, keyMap.Search):
 		m.searchInput.CursorEnd()
-		m.searchInput.Width = m.termWidth - 2 // -1 for the prompt, -1 for the cursor
+		m.searchInput.SetWidth(m.termWidth - 2) // -1 for the prompt, -1 for the cursor
 		m.searchInput.Focus()
 
 	case key.Matches(msg, keyMap.SearchNext):
@@ -950,32 +1214,43 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.recordHistory()
 
 	case key.Matches(msg, keyMap.GoBack):
-		if m.locationIndex > 0 {
-			at, ok := m.cursorPointsTo()
-			if !ok {
-				return m, nil
-			}
-			m.locationIndex--
-
-			loc := m.locationHistory[m.locationIndex]
-			for loc.node == at && m.locationIndex > 0 {
-				m.locationIndex--
-				loc = m.locationHistory[m.locationIndex]
-			}
-			m.selectNode(loc.head)
-			m.selectNode(loc.node)
+		at, ok := m.cursorPointsTo()
+		if !ok {
+			return m, nil
+		}
+		// Skip the current location, and locations deleted since.
+		i := m.locationIndex - 1
+		for i >= 0 && (m.locationHistory[i].node == at || !m.locationHistory[i].node.InDocument()) {
+			i--
+		}
+		if i >= 0 {
+			m.locationIndex = i
+			m.goToLocation(m.locationHistory[i])
 		}
 
 	case key.Matches(msg, keyMap.GoForward):
-		if m.locationIndex < len(m.locationHistory)-1 {
-			m.locationIndex++
-			loc := m.locationHistory[m.locationIndex]
-			m.selectNode(loc.head)
-			m.selectNode(loc.node)
+		i := m.locationIndex + 1
+		for i < len(m.locationHistory) && !m.locationHistory[i].node.InDocument() {
+			i++
+		}
+		if i < len(m.locationHistory) {
+			m.locationIndex = i
+			m.goToLocation(m.locationHistory[i])
 		}
 
 	case key.Matches(msg, keyMap.Delete):
 		m.deletePending = true
+
+	case key.Matches(msg, keyMap.Query):
+		m.showCursor = false
+		m.queryInput.CursorEnd()
+		m.queryInput.SetWidth(m.termWidth - 1) // -1 for the cursor
+		if m.queryInput.Value() == "" {
+			m.queryInput.SetValue(".")
+		}
+		m.queryHistoryIndex = len(m.queryHistory)
+		m.queryInput.Focus()
+		return m, m.resetCompletion()
 	}
 	return m, nil
 }
@@ -1013,6 +1288,15 @@ func (m *model) down() {
 	}
 }
 
+// goToLocation selects the node of loc, scrolled as it was if its head is
+// still in the document.
+func (m *model) goToLocation(loc location) {
+	if loc.head.InDocument() {
+		m.selectNode(loc.head)
+	}
+	m.selectNode(loc.node)
+}
+
 func (m *model) recordHistory() {
 	at, ok := m.cursorPointsTo()
 	if !ok {
@@ -1033,6 +1317,32 @@ func (m *model) recordHistory() {
 		node: at,
 	})
 	m.locationIndex = len(m.locationHistory)
+}
+
+// appendNode attaches a new top-level document to the displayed list.
+func (m *model) appendNode(node *Node) {
+	if m.wrap {
+		Wrap(node, m.viewWidth())
+	}
+	if m.collapsed {
+		node.CollapseRecursively()
+	}
+
+	if m.head == nil {
+		m.head = node
+		m.top = node
+		m.bottom = node
+	} else {
+		to, ok := m.cursorPointsTo()
+		// Follow the input at the bottom, unless a reload restores the cursor.
+		scrollToBottom := ok && to == m.bottom.Bottom() && !m.reloading()
+		node.Index = -1 // To fix the statusbar path (to show .key instead of [0].key).
+		m.bottom.Adjacent(node)
+		m.bottom = node
+		if scrollToBottom {
+			m.scrollToBottom()
+		}
+	}
 }
 
 func (m *model) scrollToBottom() {
@@ -1071,6 +1381,9 @@ func (m *model) scrollIntoView() {
 }
 
 func (m *model) scrollBackward(lines int) {
+	if m.head == nil {
+		return
+	}
 	it := m.head
 	for it.Prev != nil {
 		it = it.Prev
@@ -1093,6 +1406,30 @@ func (m *model) scrollForward(lines int) {
 		}
 	}
 	m.head = it
+}
+
+// scrollUp moves the view one line backward. The cursor stays on the same
+// node unless that would push it below the view, like Ctrl-Y in vim.
+func (m *model) scrollUp() {
+	if m.head == nil || m.head.Prev == nil {
+		return
+	}
+	m.head = m.head.Prev
+	if m.cursor < m.viewHeight()-1 {
+		m.cursor++
+	}
+}
+
+// scrollDown moves the view one line forward. The cursor stays on the same
+// node unless that would push it above the view, like Ctrl-E in vim.
+func (m *model) scrollDown() {
+	if m.head == nil || m.head.Next == nil {
+		return
+	}
+	m.head = m.head.Next
+	if m.cursor > 0 {
+		m.cursor--
+	}
 }
 
 func (m *model) prettyKey(node *Node, selected bool) []byte {
@@ -1178,11 +1515,14 @@ func (m *model) viewHeight() int {
 	if m.gotoSymbolInput.Focused() {
 		return m.termHeight - 2
 	}
-	if m.commandInput.Focused() {
+	if m.commandInput.Focused() || m.confirm != nil || m.message != nil {
 		return m.termHeight - 2
 	}
 	if m.searchInput.Focused() || m.searchInput.Value() != "" {
 		return m.termHeight - 2
+	}
+	if m.queryInput.Focused() || m.queryInput.Value() != "" {
+		return m.termHeight - 2 - m.completionRows()
 	}
 	if m.yank {
 		return m.termHeight - 2
@@ -1237,6 +1577,42 @@ func (m *model) selectNodeInView(n *Node) {
 			return
 		}
 		head = head.Next
+	}
+}
+
+// repairHead moves the first displayed line back into the list when it is
+// no longer a line of it: hidden by collapsing, deleted, or a wrap chunk
+// dropped by re-wrapping. Rendering and scrolling walk the list from head,
+// and a stale head walks nodes that are not linked, or loops.
+func (m *model) repairHead() {
+	if m.head == nil || m.head.IsLinked() {
+		if m.head == nil {
+			m.head = m.top
+		}
+		return
+	}
+	// The cursor is a row below head: keep it on its node if that is
+	// still displayed, as moving head shifts every row.
+	at, ok := m.cursorPointsTo()
+	h := m.head
+	for h != nil && !h.IsLinked() {
+		switch {
+		case h.HiddenBy() != nil:
+			h = h.HiddenBy()
+		case h.IsWrap():
+			h = h.Parent
+		default:
+			h = h.Prev // Deleted: its Prev was the line before it.
+		}
+	}
+	if h == nil {
+		h = m.top
+	}
+	m.head = h
+	if ok && at.IsLinked() {
+		showCursor := m.showCursor
+		m.selectNode(at)
+		m.showCursor = showCursor
 	}
 }
 
@@ -1302,13 +1678,13 @@ func (m *model) cursorValue() string {
 		if at.Chunk != "" && at.Value == "" {
 			at = parent
 		}
-		if len(at.Value) >= 1 && at.Value[0] == '}' || at.Value[0] == ']' {
+		if len(at.Value) >= 1 && (at.Value[0] == '}' || at.Value[0] == ']') {
 			at = parent
 		}
 	}
 
 	if at.Kind == String {
-		str, err := strconv.Unquote(at.Value)
+		str, err := utils.Unquote(at.Value)
 		if err == nil {
 			return str
 		}
@@ -1439,28 +1815,6 @@ func (m *model) print() tea.Cmd {
 	return tea.Quit
 }
 
-func (m *model) open() tea.Cmd {
-	if engine.FilePath == "" {
-		return nil
-	}
-	command := append(
-		strings.Split(lookup([]string{"FX_EDITOR", "EDITOR"}, "vim"), " "),
-		engine.FilePath,
-	)
-	if command[0] == "vi" || command[0] == "vim" || command[0] == "hx" {
-		at, ok := m.cursorPointsTo()
-		if ok {
-			tail := command[1:]
-			command = append([]string{command[0]}, fmt.Sprintf("+%d", at.LineNumber))
-			command = append(command, tail...)
-		}
-	}
-	execCmd := exec.Command(command[0], command[1:]...)
-	return tea.ExecProcess(execCmd, func(err error) tea.Msg {
-		return nil
-	})
-}
-
 // deleteAtCursor deletes the current key/value (node) from the view structure.
 func (m *model) deleteAtCursor() {
 	at, ok := m.cursorPointsTo()
@@ -1468,6 +1822,7 @@ func (m *model) deleteAtCursor() {
 		return
 	}
 	if next, ok := DeleteNode(at); ok {
+		m.repairHead()
 		m.selectNode(next)
 		m.recordHistory()
 	}

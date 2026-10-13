@@ -2,6 +2,7 @@ package jsonx
 
 import (
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -97,4 +98,59 @@ func TestNode_ForEach_SkipsNested(t *testing.T) {
 		}
 	})
 	assert.Equal(t, []string{"a", "c"}, keys)
+}
+
+func TestNode_AdjacentKeepsWrapChunks(t *testing.T) {
+	n, err := Parse([]byte(`"` + strings.Repeat("word ", 30) + `"`))
+	require.NoError(t, err)
+	Wrap(n, 20)
+	require.NotNil(t, n.ChunkEnd)
+	chunkEnd := n.ChunkEnd
+
+	next, err := Parse([]byte(`1`))
+	require.NoError(t, err)
+	n.Adjacent(next)
+
+	require.Same(t, next, chunkEnd.Next)
+	require.Same(t, chunkEnd, next.Prev)
+	require.NotSame(t, next, n.Next, "chunks must stay between the string and the next document")
+}
+
+// A key Go can't unquote (JSON's \/ escape) used to loop forever.
+func TestNode_FindByPathSkipsKeyGoCantUnquote(t *testing.T) {
+	n, err := Parse([]byte(`{"a\/b": 1, "c": 2}`))
+	require.NoError(t, err)
+	c := n.FindByPath([]any{"c"})
+	require.NotNil(t, c)
+	require.Equal(t, "2", c.Value)
+}
+
+func TestInDocument(t *testing.T) {
+	root, err := Parse([]byte(`{"a":{"b":{"c":1,"d":2},"e":3},"f":4}`))
+	require.NoError(t, err)
+	key := func(k string) *Node {
+		for it := root; it != nil; it = it.Next {
+			if it.Key == k {
+				return it
+			}
+		}
+		t.Fatalf("no %s", k)
+		return nil
+	}
+	a, b, c, d := key(`"a"`), key(`"b"`), key(`"c"`), key(`"d"`)
+
+	a.Collapse()
+	require.True(t, c.InDocument(), "hidden by collapsing is still in the document")
+	require.True(t, b.InDocument(), "first child of a collapsed container")
+	require.False(t, c.IsLinked(), "but not a displayed line")
+	a.Expand()
+
+	_, ok := DeleteNode(b)
+	require.True(t, ok)
+	require.False(t, b.InDocument(), "deleted")
+	require.False(t, c.InDocument(), "in a deleted container")
+	require.False(t, d.InDocument(), "in a deleted container")
+	require.False(t, c.IsLinked())
+	require.True(t, key(`"e"`).InDocument())
+	require.True(t, root.InDocument())
 }

@@ -3,12 +3,16 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/key"
+	"charm.land/lipgloss/v2"
+
+	"github.com/zxyqq/fx/internal/format"
 )
 
 func usage() string {
@@ -29,11 +33,10 @@ func usage() string {
     --comp <shell>        print completion script
     -r, --raw             treat input as a raw string
     -s, --slurp           read all inputs into an array
-    --yaml                parse input as YAML
-    --toml                parse input as TOML
-    --strict              strict mode
+%v    --strict              strict mode
     --no-inline           disable inlining in output
-    --game-of-life        play the game of life
+    --no-tui              print output instead of the viewer
+    --dungeon             play the dungeon
 
   %v
     https://fx.wtf
@@ -44,6 +47,7 @@ func usage() string {
 		title.Render("fx "+version),
 		title.Render("Usage"),
 		title.Render("Flags"),
+		formatFlags(),
 		title.Render("More info"),
 		title.Render("Author"),
 	)
@@ -90,12 +94,33 @@ func help(keyMap KeyMap) string {
 
 	var sb strings.Builder
 
-	// Header
-	sb.WriteString("\n")
-	sb.WriteString(titleStyle.Render("  Key Bindings"))
-	sb.WriteString("\n")
-	sb.WriteString(dimStyle.Render("  ─────────────────────────────────────────"))
-	sb.WriteString("\n")
+	section := func(title string) {
+		sb.WriteString("\n")
+		sb.WriteString(titleStyle.Render("  " + title))
+		sb.WriteString("\n")
+		sb.WriteString(dimStyle.Render("  ─────────────────────────────────────────"))
+		sb.WriteString("\n")
+	}
+
+	category := func(name string) {
+		sb.WriteString(categoryStyle.Render("  " + name))
+		sb.WriteString("\n")
+	}
+
+	row := func(keyStr, desc string) {
+		keyFormatted := keyStyle.Render(fmt.Sprintf("%-24s", keyStr))
+		descFormatted := descStyle.Render(desc)
+		sb.WriteString(fmt.Sprintf("    %s  %s\n", keyFormatted, descFormatted))
+	}
+
+	text := func(lines ...string) {
+		sb.WriteString("\n")
+		for _, line := range lines {
+			sb.WriteString("    " + line + "\n")
+		}
+	}
+
+	section("Key Bindings")
 
 	for _, cat := range categoryOrder {
 		bindings, ok := categories[cat]
@@ -103,8 +128,7 @@ func help(keyMap KeyMap) string {
 			continue
 		}
 
-		sb.WriteString(categoryStyle.Render("  " + cat))
-		sb.WriteString("\n")
+		category(cat)
 
 		for _, binding := range bindings {
 			keyStr := binding.Help().Key
@@ -116,18 +140,42 @@ func help(keyMap KeyMap) string {
 					keyStr = strings.Join(keys, ", ")
 				}
 			}
-
-			desc := binding.Help().Desc
-			keyFormatted := keyStyle.Render(fmt.Sprintf("%-20s", keyStr))
-			descFormatted := descStyle.Render(desc)
-
-			sb.WriteString(fmt.Sprintf("    %s  %s\n", keyFormatted, descFormatted))
+			row(keyStr, binding.Help().Desc)
 		}
 	}
 
 	sb.WriteString("\n")
-	sb.WriteString(dimStyle.Render("  ─────────────────────────────────────────"))
+	section("Commands")
+	text("Press : to open the command line.")
 	sb.WriteString("\n")
+	for _, c := range commands {
+		row(":"+c.usage(), c.desc)
+	}
+
+	sb.WriteString("\n")
+	section("Query")
+	text(
+		"Press . to open the query input,",
+		"type a query and press enter.",
+	)
+
+	category("Syntax")
+	row(".name", "property, .items[0] for index")
+	row(".items[].name", "map over array")
+	row("@.name", "map with expression")
+	row("?.active", "filter with expression")
+	row("x => x.a + 1", "any JS expression, x is input")
+	row("len keys sort uniq", "built-in functions")
+	row(".items len", "space separates piped queries")
+
+	category("Input Keys")
+	row("tab, shift+tab", "complete, cycle candidates")
+	row("right, end, ctrl+e", "accept suggestion")
+	row("up, down", "query history")
+	row("enter", "apply query")
+	row("esc", "cancel, restore original")
+
+	sb.WriteString("\n\n\n")
 	sb.WriteString(dimStyle.Render("  Press q or ? to close"))
 	sb.WriteString("\n")
 
@@ -135,41 +183,79 @@ func help(keyMap KeyMap) string {
 }
 
 func exit() {
-	if showLetter(time.Now()) {
+	if showLetter(time.Now(), letterDir()) {
 		style := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(1, 2)
 		_, _ = fmt.Fprintln(os.Stderr, style.Render(`Hello, kind human. :)
 
-This is fx speaking. I know you’re busy, and I won’t take much
-of your time.
+This is fx speaking.
 
-Every day, I quietly sit in your terminal, helping you explore
-and shape your data. No popups, no ads, quiet, helpful work.
+Most days, I quietly sit in your terminal and help you work
+with JSON. No ads, no popups, no interruptions.
 
-But today is different.
+Today, I have one small request.
 
-Today, I’m asking for something small in return. Just for today.
-
-If fx has saved you time, solved a problem, or simply made your 
-life in the terminal a little easier, please consider supporting 
-the developer who made me:
+If fx has been useful to you, please consider supporting
+the developer who keeps me alive and improving:
 
     https://github.com/sponsors/antonmedv
 
-He built fx as a passion project, shared it freely with the world, 
-and has kept improving it—all without asking much.
+Even a small contribution helps.
 
-Your support helps keep fx alive, maintained, and improving.
-Even a small donation means a lot. It shows that you care, that 
-this kind of work matters.
+That’s all. Tomorrow I’ll be quiet again.
 
-This message only appears once, on the first Tuesday of December.
-Tomorrow I’ll be silent again.
-
-Thank you for reading. And thank you for using fx.`))
+Thank you for using fx.`))
 	}
 }
 
-func showLetter(t time.Time) bool {
+// letterDir returns the directory where fx remembers that the letter was
+// shown: $XDG_CONFIG_HOME/fx, or ~/.config/fx. Empty if neither is known.
+func letterDir() string {
+	dir := os.Getenv("XDG_CONFIG_HOME")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			return ""
+		}
+		dir = filepath.Join(home, ".config")
+	}
+	return filepath.Join(dir, "fx")
+}
+
+// showLetter reports whether the letter should be shown at time t. The letter
+// is shown in December before Christmas, once per year: a marker file in dir
+// records the year it was shown. If the marker cannot be read or written,
+// the letter is shown on the first Tuesday of December instead.
+func showLetter(t time.Time, dir string) bool {
+	if t.Month() != time.December || t.Day() >= 25 {
+		return false
+	}
+	if dir != "" {
+		if shown, ok := markLetterShown(dir, t.Year()); ok {
+			return !shown
+		}
+	}
+	return isFirstTuesdayOfDecember(t)
+}
+
+// markLetterShown records year in the marker file in dir. shown is true if
+// the file already recorded year. ok is false if the marker could not be
+// read or written, in which case nothing is recorded.
+func markLetterShown(dir string, year int) (shown, ok bool) {
+	path := filepath.Join(dir, "letter")
+	data, err := os.ReadFile(path)
+	if err == nil && strings.TrimSpace(string(data)) == strconv.Itoa(year) {
+		return true, true
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return false, false
+	}
+	if err := os.WriteFile(path, []byte(strconv.Itoa(year)+"\n"), 0o644); err != nil {
+		return false, false
+	}
+	return false, true
+}
+
+func isFirstTuesdayOfDecember(t time.Time) bool {
 	if t.Month() != time.December {
 		return false
 	}
@@ -179,4 +265,14 @@ func showLetter(t time.Time) bool {
 	return t.Year() == firstTuesday.Year() &&
 		t.Month() == firstTuesday.Month() &&
 		t.Day() == firstTuesday.Day()
+}
+
+// formatFlags lists the input format flags for the usage text, one line
+// each, aligned with the other flags.
+func formatFlags() string {
+	var b strings.Builder
+	for _, f := range format.All {
+		fmt.Fprintf(&b, "    %-22s%s\n", f.Flag, f.Help)
+	}
+	return b.String()
 }

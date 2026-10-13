@@ -23,6 +23,28 @@ type JsonParser struct {
 	realLineNumber int
 	depth          uint8
 	count          int
+	err            error // error found by More, until Recover
+	readFailed     bool  // err is a read error: no more input
+	nesting        int   // Depth without wrapping, to limit recursion.
+	valueStart     int   // Offset in data of the value being parsed.
+}
+
+// MaxNesting is the deepest nesting of arrays and objects parsed, as in
+// encoding/json: the parser recurses, and a stack overflow is fatal.
+const MaxNesting = 10_000
+
+// enter descends into a value of an array or object.
+func (p *JsonParser) enter() {
+	p.nesting++
+	if p.nesting > MaxNesting {
+		panic(fmt.Sprintf("Exceeded max depth of %d nested arrays and objects", MaxNesting))
+	}
+	p.depth++
+}
+
+func (p *JsonParser) leave() {
+	p.nesting--
+	p.depth--
 }
 
 func Parse(b []byte) (*Node, error) {
@@ -42,32 +64,133 @@ func NewJsonParser(rd io.Reader, strict bool) *JsonParser {
 		lineNumber:     1,
 		realLineNumber: 1,
 	}
-	p.next() // Should be called here, to support streaming.
+	// Read here, to support streaming. A read error, as on a directory, is
+	// returned by Parse.
+	func() {
+		defer p.recoverReadError()
+		p.next()
+		p.skipBOM()
+	}()
 	return p
+}
+
+// readError is the panic of a failed read of the input.
+type readError struct {
+	err error
+}
+
+// recoverReadError keeps a read error, which every later call returns: the
+// input can't be read past it.
+func (p *JsonParser) recoverReadError() {
+	if r := recover(); r != nil {
+		e, ok := r.(readError)
+		if !ok {
+			panic(r)
+		}
+		p.failRead(e.err)
+	}
+}
+
+// failRead keeps err, the input can't be read past it.
+func (p *JsonParser) failRead(err error) {
+	p.err, p.eof, p.readFailed = err, true, true
+}
+
+// skipBOM skips a UTF-8 byte order mark at the start of the input.
+func (p *JsonParser) skipBOM() {
+	if p.char != 0xEF {
+		return
+	}
+	for _, b := range []byte{0xEF, 0xBB, 0xBF} {
+		if p.char != b {
+			// Not a BOM: rewind to the first byte.
+			p.end, p.char, p.eof, p.realLineNumber = 1, p.data[0], false, 1
+			return
+		}
+		p.next()
+	}
 }
 
 func (p *JsonParser) Parse() (node *Node, err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			if e, ok := r.(readError); ok {
+				p.failRead(e.err)
+				node, err = nil, e.err
+				return
+			}
 			err = p.errorSnippet(fmt.Sprintf("%v", r))
 		}
 	}()
-	if p.count > 0 {
-		p.skipWhitespace()
+	if p.err != nil {
+		return nil, p.err
 	}
+	p.nesting = 0
+	p.markValueStart()
+	p.skipWhitespace()
 	if p.eof {
 		return nil, io.EOF
 	}
+	p.markValueStart()
 	node = p.parseValue(true)
 	p.count++
+	p.markValueStart() // Parsed: nothing to recover before here.
 	return
 }
 
-func (p *JsonParser) Recover() *Node {
+// More reports whether input remains after the values parsed so far. It
+// reads ahead, so on a stream it blocks until more input or EOF arrives.
+func (p *JsonParser) More() (more bool, err error) {
+	if p.err != nil {
+		return false, p.err
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			if e, ok := r.(readError); ok {
+				p.failRead(e.err)
+			} else {
+				p.err = p.errorSnippet(fmt.Sprintf("%v", r))
+			}
+			more, err = false, p.err
+		}
+	}()
+	p.markValueStart()
+	p.skipWhitespace()
+	p.markValueStart()
+	return !p.eof, nil
+}
+
+// markValueStart records the current character as where the next value
+// starts: Recover returns the text of a value that failed from there. It is
+// marked before skipping whitespace too, as a bad comment fails in it.
+func (p *JsonParser) markValueStart() {
+	p.valueStart = p.end - 1
+}
+
+// Recover returns the text from the last error to the next value, or nil
+// if the input can't be read further.
+func (p *JsonParser) Recover() (node *Node) {
+	if p.readFailed {
+		return nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			if e, ok := r.(readError); ok {
+				p.failRead(e.err)
+				node = nil
+				return
+			}
+			panic(r)
+		}
+	}()
+	p.err = nil
 	p.eof = false
 	p.depth = 0
+	p.nesting = 0
 
-	start := p.end - 1
+	// The text of the value that failed, from its start: the error is
+	// somewhere in it, as in INFO, read as the start of Infinity.
+	start := p.valueStart
 	for {
 		p.next()
 		if p.eof {
@@ -84,6 +207,10 @@ func (p *JsonParser) Recover() *Node {
 	}
 
 	start = max(0, min(start, end))
+	// A value failing in a comment starts before the whitespace skipped.
+	for start < end && (p.data[start] == '\n' || p.data[start] == '\r') {
+		start++
+	}
 	text := string(p.data[start:end])
 	text = strings.ReplaceAll(text, "\t", "    ")
 	text = strings.ReplaceAll(text, "\r", "")
@@ -108,16 +235,23 @@ func (p *JsonParser) Recover() *Node {
 }
 
 func (p *JsonParser) refill() {
-	n, err := p.rd.Read(p.buf)
-	if err != nil {
-		if err == io.EOF {
+	// A reader may return no bytes and no error; give up after many such
+	// reads, as bufio does, instead of looping forever.
+	for range 100 {
+		n, err := p.rd.Read(p.buf)
+		// Bytes come first: a reader may return them with io.EOF.
+		p.data = append(p.data, p.buf[:n]...)
+		switch {
+		case err == io.EOF && n == 0:
 			p.eof = true
 			return
-		} else {
-			panic(err)
+		case err != nil && err != io.EOF:
+			panic(readError{err})
+		case n > 0:
+			return
 		}
 	}
-	p.data = append(p.data, p.buf[:n]...)
+	panic(readError{io.ErrNoProgress})
 }
 
 func (p *JsonParser) next() {
@@ -347,11 +481,11 @@ func (p *JsonParser) parseObject() *Node {
 
 		p.next()
 
-		p.depth++
+		p.enter()
 		value := p.parseValue(false)
 		value.Key = keyBytes
 		value.Parent = object
-		p.depth--
+		p.leave()
 
 		object.Append(value)
 		object.Size += 1
@@ -410,12 +544,12 @@ func (p *JsonParser) parseArray() *Node {
 	}
 
 	for i := 0; ; i++ {
-		p.depth++
+		p.enter()
 		value := p.parseValue(false)
 		value.Parent = arr
 		arr.Size += 1
 		value.Index = i
-		p.depth--
+		p.leave()
 
 		arr.Append(value)
 		p.skipWhitespace()

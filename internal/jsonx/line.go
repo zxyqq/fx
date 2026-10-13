@@ -48,6 +48,27 @@ func (p *LineParser) Parse() (*Node, error) {
 	return node, nil
 }
 
+// More reports whether another line remains, blocking like
+// JsonParser.More. A read error is kept for later More and Parse calls.
+func (p *LineParser) More() (bool, error) {
+	if p.eof != nil {
+		if p.eof == io.EOF {
+			return false, nil
+		}
+		return false, p.eof
+	}
+	if _, err := p.buf.Peek(1); err != nil {
+		// Kept: bufio returns a read error only once, and after save()
+		// the file is closed.
+		p.eof = err
+		if err == io.EOF {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 func (p *LineParser) Recover() *Node {
 	return nil
 }

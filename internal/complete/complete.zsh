@@ -3,6 +3,8 @@
 _fx() {
     local -a reply
     reply=("${(@f)$(COMP_ZSH="${LBUFFER}" fx)}")
+    # No output splits into one empty line, which compadd -U would insert.
+    reply=(${reply:#})
     if (( ${#reply} )); then
         local -a insert_files display_files insert_other display_other
         local line display rest value typ
@@ -26,7 +28,8 @@ _fx() {
             compadd -f -d display_files -a insert_files
         fi
         if (( ${#insert_other} )); then
-            compadd -S '' -d display_other -a insert_other
+            # -U: fx matches the word itself, and `.items.` completes to `.items[].key`.
+            compadd -U -S '' -d display_other -a insert_other
         fi
     fi
 }

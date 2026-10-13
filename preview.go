@@ -5,22 +5,27 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/key"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 var reverseStyle = lipgloss.NewStyle().Reverse(true).Render
 
 func (m *model) handlePreviewKey(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
-	if msg, ok := msg.(tea.KeyMsg); ok {
+	if paste, ok := msg.(tea.PasteMsg); ok && m.previewSearchInput.Focused() {
+		m.previewSearchInput, cmd = m.previewSearchInput.Update(paste)
+		return m, cmd
+	}
+	if msg, ok := msg.(tea.KeyPressMsg); ok {
 		if m.previewSearchInput.Focused() {
 			return m.handlePreviewSearchInput(msg)
 		}
 		switch {
 		case key.Matches(msg, keyMap.Quit),
-			key.Matches(msg, keyMap.Preview):
+			key.Matches(msg, keyMap.Preview),
+			key.Matches(msg, escKey):
 			m.showPreview = false
 			return m, nil
 
@@ -43,6 +48,14 @@ func (m *model) handlePreviewKey(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.preview.HalfPageDown()
 			return m, nil
 
+		case key.Matches(msg, keyMap.ScrollUp):
+			m.preview.ScrollUp(1)
+			return m, nil
+
+		case key.Matches(msg, keyMap.ScrollDown):
+			m.preview.ScrollDown(1)
+			return m, nil
+
 		case key.Matches(msg, keyMap.PageUp):
 			m.preview.PageUp()
 			return m, nil
@@ -53,7 +66,7 @@ func (m *model) handlePreviewKey(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case key.Matches(msg, keyMap.Search):
 			m.previewSearchInput.CursorEnd()
-			m.previewSearchInput.Width = m.termWidth - 2
+			m.previewSearchInput.SetWidth(m.termWidth - 2)
 			m.previewSearchInput.Focus()
 			return m, nil
 
@@ -70,10 +83,10 @@ func (m *model) handlePreviewKey(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m *model) handlePreviewSearchInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *model) handlePreviewSearchInput(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	switch {
-	case msg.Type == tea.KeyEscape:
+	case msg.String() == "esc":
 		m.previewSearchInput.Blur()
 		m.previewSearchInput.SetValue("")
 		m.previewSearchResults = nil
@@ -81,7 +94,7 @@ func (m *model) handlePreviewSearchInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.preview.SetContent(m.wrapString(m.previewValue))
 		return m, nil
 
-	case msg.Type == tea.KeyEnter:
+	case msg.String() == "enter":
 		m.previewSearchInput.Blur()
 		found := m.doPreviewSearch(m.previewSearchInput.Value())
 		if !found {

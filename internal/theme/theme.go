@@ -1,14 +1,16 @@
 package theme
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"sort"
 
-	"github.com/charmbracelet/lipgloss"
-	"github.com/muesli/termenv"
+	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/colorprofile"
 
 	"github.com/zxyqq/fx/internal/jsonx"
 )
@@ -57,7 +59,8 @@ func Value(kind jsonx.Kind) Color {
 }
 
 var (
-	TermOutput = termenv.NewOutput(os.Stderr)
+	// Profile is the color profile of the terminal fx draws on (stderr).
+	Profile = colorprofile.Detect(os.Stderr, os.Environ())
 )
 
 func init() {
@@ -78,7 +81,7 @@ func init() {
 		os.Exit(1)
 	}
 
-	if TermOutput.ColorProfile() == termenv.Ascii {
+	if Profile <= colorprofile.ASCII {
 		CurrentTheme = themes["0"]
 	}
 
@@ -380,49 +383,55 @@ func ThemeTester() {
 		colon := t.Syntax(":")
 
 		fmt.Println(fmt.Sprintf("export FX_THEME=%q", name))
-		fmt.Println(t.Syntax("{"))
+		lipgloss.Println(t.Syntax("{"))
 
-		fmt.Printf("  %v%v %v%v\n",
+		lipgloss.Printf("  %v%v %v%v\n",
 			t.Key("\"string\""),
 			colon,
 			t.String("\"Fox jumps over the lazy dog\""),
 			comma)
 
-		fmt.Printf("  %v%v %v%v\n",
+		lipgloss.Printf("  %v%v %v%v\n",
 			t.Key("\"number\""),
 			colon,
 			t.Number("1234567890"),
 			comma)
 
-		fmt.Printf("  %v%v %v%v\n",
+		lipgloss.Printf("  %v%v %v%v\n",
 			t.Key("\"boolean\""),
 			colon,
 			t.Boolean("true"),
 			comma)
-		fmt.Printf("  %v%v %v%v\n",
+		lipgloss.Printf("  %v%v %v%v\n",
 			t.Key("\"null\""),
 			colon,
 			t.Null("null"),
 			comma)
-		fmt.Printf("  %v%v %v%v%v\n",
+		lipgloss.Printf("  %v%v %v%v%v\n",
 			t.Key("\"collapsed\""),
 			colon,
 			t.Syntax("{"),
 			t.Preview("\"preview\":…"),
 			t.Syntax("}"),
 		)
-		fmt.Println(t.Syntax("}"))
+		lipgloss.Println(t.Syntax("}"))
 		println()
 	}
 }
 
 func ExportThemes() {
-	lipgloss.SetColorProfile(termenv.ANSI256) // Export in Terminal.app compatible colors
+	// Export in Terminal.app compatible colors.
+	ansi256 := func(styled string) string {
+		var buf bytes.Buffer
+		w := colorprofile.Writer{Forward: &buf, Profile: colorprofile.ANSI256}
+		_, _ = io.WriteString(&w, styled)
+		return buf.String()
+	}
 	placeholder := "_"
 	extract := func(b string) string {
 		matches := regexp.
 			MustCompile(`^\x1b\[(.+)m_`).
-			FindStringSubmatch(b)
+			FindStringSubmatch(ansi256(b))
 		if len(matches) == 0 {
 			return ""
 		} else {

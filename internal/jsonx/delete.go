@@ -21,6 +21,11 @@ func DeleteNode(at *Node) (*Node, bool) {
 	if parent == nil { // avoid deleting root
 		return nil, false
 	}
+	// Only a displayed line can be deleted: relinking around a node hidden
+	// in a collapsed container, or already deleted, would make a cycle.
+	if !at.IsLinked() {
+		return nil, false
+	}
 	// If current points to a wrap placeholder, move to its parent value
 	if at.Chunk != "" && at.Value == "" && at.Parent != nil {
 		at = at.Parent
@@ -44,11 +49,20 @@ func DeleteNode(at *Node) (*Node, bool) {
 	isLast := next == parent.End
 	if isLast && prev != nil && prev != parent {
 		prev.Comma = false
+		if prev.IsWrap() {
+			prev.Parent.Comma = false // A wrapped string keeps its comma on both.
+		}
+		if prev.IsCollapsed() {
+			prev.End.Comma = false // A collapsed container shows its End's comma.
+		}
 	}
 
 	// Relink to remove [at..endOf] from the chain
 	if prev != nil {
 		prev.Next = next
+		if prev.IsCollapsed() {
+			prev.End.Next = next // Expand restores Next from End.
+		}
 	}
 	if next != nil {
 		next.Prev = prev

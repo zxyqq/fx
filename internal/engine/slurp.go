@@ -6,7 +6,7 @@ import (
 	"github.com/zxyqq/fx/internal/jsonx"
 )
 
-func Slurp(parser Parser, writeErr func(string)) (Parser, bool) {
+func Slurp(parser Parser) (Parser, error) {
 	arr := &jsonx.Node{
 		Kind:       jsonx.Array,
 		Value:      "[",
@@ -20,8 +20,7 @@ func Slurp(parser Parser, writeErr func(string)) (Parser, bool) {
 			if err == io.EOF {
 				break
 			}
-			writeErr(err.Error())
-			return nil, false
+			return nil, err
 		}
 
 		node.Parent = arr
@@ -46,7 +45,7 @@ func Slurp(parser Parser, writeErr func(string)) (Parser, bool) {
 	}
 	arr.End = end.Next
 
-	return &slurpParser{node: arr}, true
+	return &slurpParser{node: arr}, nil
 }
 
 type slurpParser struct {
@@ -60,6 +59,10 @@ func (p *slurpParser) Parse() (*jsonx.Node, error) {
 	node := p.node
 	p.node = nil
 	return node, nil
+}
+
+func (p *slurpParser) More() (bool, error) {
+	return p.node != nil, nil
 }
 
 func (p *slurpParser) Recover() *jsonx.Node {
